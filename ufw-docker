@@ -47,13 +47,45 @@ function ufw-docker--list() {
     ufw status numbered | grep "# allow ${INSTANCE_NAME}\$"
 }
 
+function ufw-docker--list-from() {
+    local INSTANCE_NAME="$1"
+    local FROM="$2"
+    local INSTANCE_PORT="${3:-}"
+    local PROTO="${4:-${DEFAULT_PROTO}}"
+    local NETWORK="${5:-}"
+
+    if [[ -z "$INSTANCE_PORT" ]]; then
+        INSTANCE_PORT="[[:digit:]]\\+"
+        PROTO="\\(tcp\\|udp\\)"
+    fi
+
+    if [[ -z "$NETWORK" ]]; then
+       NETWORK="[[:graph:]]*"
+    fi
+
+    ufw status numbered | grep "# allow ${INSTANCE_NAME} from ${FROM}\\( ${INSTANCE_PORT}\\/${PROTO}\\)\\( ${NETWORK}\\)\$" ||  \
+    ufw status numbered | grep "# allow ${INSTANCE_NAME} from ${FROM}\\( ${INSTANCE_PORT}\\/${PROTO}\\)\$" || \
+    ufw status numbered | grep "# allow ${INSTANCE_NAME} from ${FROM}\$"
+}
+
 function ufw-docker--list-number() {
     ufw-docker--list "$@" | sed -e 's/^\[[[:blank:]]*\([[:digit:]]\+\)\].*/\1/'
+}
+
+function ufw-docker--list-from-number() {
+    ufw-docker--list-from "$@" | sed -e 's/^\[[[:blank:]]*\([[:digit:]]\+\)\].*/\1/'
 }
 
 function ufw-docker--delete() {
     for UFW_NUMBER in $(ufw-docker--list-number "$@" | sort -rn); do
         echo "delete \"$UFW_NUMBER\""
+        echo y | ufw delete "$UFW_NUMBER" || true
+    done
+}
+
+function ufw-docker--delete-from() {
+    for UFW_NUMBER in $(ufw-docker--list-from-number "$@" | sort -rn); do
+        echo "delete-from \"$UFW_NUMBER\""
         echo y | ufw delete "$UFW_NUMBER" || true
     done
 }
@@ -90,6 +122,49 @@ function ufw-docker--allow() {
                     continue
                 fi
                 ufw-docker--add-rule "$INSTANCE_NAME" "$IP" "${PORT_PROTO%/*}" "${PORT_PROTO#*/}" "${INSTANCE_NETWORK}"
+                RETVAL="$?"
+            done
+        fi
+    done
+    if [[ "$RETVAL" -ne 0 ]]; then
+        err "Fail to add rule(s), cannot find the published port ${INSTANCE_PORT}/${PROTO} of instance \"${INSTANCE_NAME}\" or cannot update outdated rule(s)."
+    fi
+    return "$RETVAL"
+}
+
+function ufw-docker--allow-from() {
+    local INSTANCE_NAME="$1"
+    local FROM="$2"
+    local INSTANCE_PORT="$3"
+    local PROTO="$4"
+    local NETWORK="${5:-}"
+
+    docker inspect "$INSTANCE_NAME" &>/dev/null ||
+        die "Docker instance \"$INSTANCE_NAME\" doesn't exist."
+
+    mapfile -t INSTANCE_IP_ADDRESSES < <(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$INSTANCE_NAME" 2>/dev/null | remove_blank_lines)
+
+    [[ -z "${INSTANCE_IP_ADDRESSES:-}" ]] && die "Could not find a running instance \"$INSTANCE_NAME\"."
+
+    mapfile -t INSTANCE_NETWORK_NAMES < <(docker inspect --format='{{range $k, $v := .NetworkSettings.Networks}}{{printf "%s\n" $k}}{{end}}' "$INSTANCE_NAME" 2>/dev/null | remove_blank_lines)
+    mapfile -t PORT_PROTO_LIST < <(docker inspect --format='{{range $p, $conf := .NetworkSettings.Ports}}{{with $conf}}{{$p}}{{"\n"}}{{end}}{{end}}' "$INSTANCE_NAME" | remove_blank_lines)
+
+    if [[ -z "${PORT_PROTO_LIST:-}" ]]; then
+        err "\"$INSTANCE_NAME\" doesn't have any published ports."
+        return 1
+    fi
+
+    RETVAL=1
+    for PORT_PROTO in "${PORT_PROTO_LIST[@]}"; do
+        if [[ -z "$INSTANCE_PORT" || "$PORT_PROTO" = "${INSTANCE_PORT}/${PROTO}" ]]; then
+            ITER=0
+            for IP in "${INSTANCE_IP_ADDRESSES[@]}"; do
+                INSTANCE_NETWORK="${INSTANCE_NETWORK_NAMES[$ITER]}"
+                ITER=$((ITER+1))
+                if [[ -n "$NETWORK" ]] && [[ "$NETWORK" != "$INSTANCE_NETWORK" ]]; then
+                    continue
+                fi
+                ufw-docker--add-from-rule "$INSTANCE_NAME" "$IP" "$FROM" "${PORT_PROTO%/*}" "${PORT_PROTO#*/}" "${INSTANCE_NETWORK}"
                 RETVAL="$?"
             done
         fi
@@ -140,6 +215,39 @@ function ufw-docker--add-rule() {
         ufw --dry-run "${UFW_OPTS[@]}" | grep "^Skipping" && return 0
         err "Remove outdated rule."
         ufw-docker--delete "$INSTANCE_NAME" "$PORT" "$PROTO" "$NETWORK"
+    fi
+    echo ufw "${UFW_OPTS[@]}"
+    ufw "${UFW_OPTS[@]}"
+}
+
+function ufw-docker--add-from-rule() {
+    local INSTANCE_NAME="$1"
+    local INSTANCE_IP_ADDRESS="$2"
+    local FROM="$3"
+    local PORT="$4"
+    local PROTO="$5"
+    local NETWORK="${6:-}"
+
+    declare comment
+
+    echo "allow ${INSTANCE_NAME} ${PORT}/${PROTO} ${NETWORK} from ${FROM}"
+    typeset -a UFW_OPTS
+    UFW_OPTS=(route allow proto "${PROTO}"
+              from "$FROM" to "$INSTANCE_IP_ADDRESS")
+    comment="allow ${INSTANCE_NAME} from ${FROM}"
+    [[ -n "$PORT" ]] && {
+        UFW_OPTS+=(port "${PORT}")
+        comment="$comment ${PORT}/${PROTO}"
+    }
+    [[ -n "$NETWORK" ]] && {
+        comment="$comment ${NETWORK}"
+    }
+    UFW_OPTS+=(comment "$comment")
+
+    if ufw-docker--list-from "$INSTANCE_NAME" "$FROM" "$PORT" "$PROTO" "$NETWORK" &>/dev/null; then
+        ufw --dry-run "${UFW_OPTS[@]}" | grep "^Skipping" && return 0
+        err "Remove outdated rule."
+        ufw-docker--delete "$INSTANCE_NAME" "$FROM" "$PORT" "$PROTO" "$NETWORK"
     fi
     echo ufw "${UFW_OPTS[@]}"
     ufw "${UFW_OPTS[@]}"
@@ -372,7 +480,9 @@ function ufw-docker--help() {
     cat <<-EOF >&2
 	Usage:
 	  ufw-docker <list|allow> [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
+	  ufw-docker <list-from|allow-from> [docker-instance-id-or-name from-ip [port[/tcp|/udp]] [network]]
 	  ufw-docker delete allow [docker-instance-id-or-name [port[/tcp|/udp]] [network]]
+	  ufw-docker delete-from allow-from [docker-instance-id-or-name from-ip [port[/tcp|/udp]] [network]]
 
 	  ufw-docker service allow <swarm-service-id-or-name <port</tcp|/udp>>>
 	  ufw-docker service delete allow <swarm-service-id-or-name>
@@ -397,7 +507,7 @@ function ufw-docker--help() {
 
 	  ufw-docker delete allow httpd
 	  ufw-docker delete allow httpd 80/tcp
-          ufw-docker delete allow httpd 80/tcp default
+    ufw-docker delete allow httpd 80/tcp default
 
 	  ufw-docker service allow httpd 80/tcp
 
@@ -461,6 +571,41 @@ case "$ufw_action" in
 
         "ufw-docker--$ufw_action" "$INSTANCE_NAME" "$INSTANCE_PORT" "$PROTO" "$NETWORK"
         ;;
+    delete-from)
+          shift || true
+          if [[ "${1:?Invalid 'delete-from' command syntax.}" != "allow-from" ]]; then
+              die "\"delete-from\" command only support removing allowed rules"
+          fi
+          ;&
+    list-from|allow-from)
+
+        shift || true
+
+        INSTANCE_ID="${1:?Docker instance name/ID cannot be empty.}"
+        INSTANCE_NAME="$(ufw-docker--instance-name "$INSTANCE_ID")"
+        shift || true
+
+        FROM=${1:?From IP cannot be empty.}
+
+        shift || true
+
+        INSTANCE_PORT="${1:-}"
+        if [[ -n "$INSTANCE_PORT" && ! "$INSTANCE_PORT" =~ [0-9]+(/(tcp|udp))? ]]; then
+            die "invalid port syntax: \"$INSTANCE_PORT\"."
+        fi
+
+        PROTO="$DEFAULT_PROTO"
+        if [[ "$INSTANCE_PORT" = */udp ]]; then
+            PROTO=udp
+        fi
+        shift || true
+
+        NETWORK="${1:-}"
+
+        INSTANCE_PORT="${INSTANCE_PORT%/*}"
+
+        "ufw-docker--$ufw_action" "$INSTANCE_NAME" "$FROM" "$INSTANCE_PORT" "$PROTO" "$NETWORK"
+        ;;
     service|raw-command|add-service-rule)
         shift || true
         "ufw-docker--$ufw_action" "$@"
@@ -472,3 +617,4 @@ case "$ufw_action" in
         ufw-docker--help
         ;;
 esac
+
